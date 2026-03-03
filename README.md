@@ -40,7 +40,7 @@ A synthetic data generation and segmentation model training pipeline for 2D obje
 ### Run Vectorized Multi-Environment Scene
 
 ```bash
-./python.sh python vectorized_scene.py
+./python.sh vectorized_scene.py
 ```
 
 Launches a parallelized Isaac Sim scene across multiple environments for efficient data collection.
