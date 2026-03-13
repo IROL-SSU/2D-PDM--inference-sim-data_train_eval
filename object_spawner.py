@@ -4,13 +4,27 @@ from __future__ import annotations
 
 import os
 import random
+import math
 from typing import Optional
+from collections import defaultdict
 
 import torch
 
 from isaacsim.core.prims import SingleRigidPrim, SingleXFormPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
 from omni.isaac.core.prims import RigidPrimView, XFormPrimView
+
+
+# 카테고리 간 유사도 맵 (소문자로 통일)
+SIMILARITY_MAP = {
+    "book": {"book": 0.8, "toy": 0.5, "fruit": 0.2, "packaged_food": 0.2},
+    "toy": {"book": 0.5, "toy": 0.8, "fruit": 0.2, "packaged_food": 0.2},
+    "fruit": {"book": 0.2, "toy": 0.2, "fruit": 0.8, "packaged_food": 0.5},
+    "packaged_food": {"book": 0.2, "toy": 0.2, "fruit": 0.5, "packaged_food": 0.8},
+}
+
+# 유사도 점수에 따른 스폰 반경 (높은 유사도 = 가까이, 낮은 유사도 = 멀리)
+SCORE_TO_RADIUS = {0.8: 0.05, 0.5: 0.10, 0.2: 0.15}
 
 
 class ObjectSpawner:
@@ -88,8 +102,10 @@ class ObjectSpawner:
         # Discover assets across all categories
         # objects_dir:   {"cracker_box": "/…/Food/cracker_box.usd", …}
         # objects_class:  {"cracker_box": "Food", "teddy_bear": "Toy", …}
+        # folder_to_usd:  {"book_1": "Book_02", "fruit_1": "Apple", …}  폴더이름 → USD이름 매핑
         self._objects_dir: dict[str, str] = {}
         self._objects_class: dict[str, str] = {}
+        self._folder_to_usd: dict[str, str] = {}  # 폴더 이름 → USD 파일 이름 매핑
 
         for category in self._categories:
             usd_dir = os.path.join(self._usd_folder_dir, category)
@@ -97,11 +113,17 @@ class ObjectSpawner:
                 raise FileNotFoundError(
                     f"Category directory not found: {usd_dir}"
                 )
-            for f in os.listdir(usd_dir):
-                if f.endswith(extensions):
-                    name = os.path.splitext(f)[0]
-                    self._objects_dir[name] = os.path.join(usd_dir, f)
-                    self._objects_class[name] = category
+            # 서브폴더 내의 USD 파일 검색 (예: Book/book_1/Book_02.usd)
+            for subdir in os.listdir(usd_dir):
+                subdir_path = os.path.join(usd_dir, subdir)
+                if os.path.isdir(subdir_path):
+                    for f in os.listdir(subdir_path):
+                        if f.endswith(extensions):
+                            name = os.path.splitext(f)[0]
+                            self._objects_dir[name] = os.path.join(subdir_path, f)
+                            self._objects_class[name] = category
+                            # 폴더 이름(book_1) → USD 이름(Book_02) 매핑 저장
+                            self._folder_to_usd[subdir.lower()] = name
 
         if not self._objects_dir:
             raise FileNotFoundError(
@@ -181,15 +203,250 @@ class ObjectSpawner:
             world_positions = container_world_pos + local_offsets
             view.set_world_poses(world_positions)
 
+    # ------------------------------------------------------------------
+    # 유사도 기반 순차 스폰 API (Genesis scene_generator.py 로직 포팅)
+    # ------------------------------------------------------------------
+    def resolve_target_name(self, name: str) -> str:
+        """폴더 이름(book_1)을 USD 파일 이름(Book_02)으로 변환
+        
+        이미 USD 파일 이름이면 그대로 반환
+        """
+        name_lower = name.lower()
+        
+        # 1. 폴더 이름으로 매핑 검색 (book_1 → Book_02)
+        if name_lower in self._folder_to_usd:
+            return self._folder_to_usd[name_lower]
+        
+        # 2. 이미 USD 파일 이름인 경우
+        for obj_name in self._spawned_names:
+            if obj_name.lower() == name_lower:
+                return obj_name
+        
+        # 3. 부분 매칭 시도
+        for obj_name in self._spawned_names:
+            if name_lower in obj_name.lower() or obj_name.lower() in name_lower:
+                return obj_name
+        
+        return name  # 찾지 못하면 원본 반환
+    
+    def get_object_index_by_name(self, name: str) -> int:
+        """오브젝트 이름으로 인덱스 찾기 (폴더 이름도 지원)"""
+        # 먼저 폴더 이름을 USD 이름으로 변환
+        resolved_name = self.resolve_target_name(name)
+        
+        for i, obj_name in enumerate(self._spawned_names):
+            if obj_name.lower() == resolved_name.lower():
+                return i
+        
+        # 부분 매칭 시도
+        for i, obj_name in enumerate(self._spawned_names):
+            if resolved_name.lower() in obj_name.lower() or obj_name.lower() in resolved_name.lower():
+                return i
+        
+        raise ValueError(
+            f"Object '{name}' (resolved: '{resolved_name}') not found.\n"
+            f"Available objects: {self._spawned_names}\n"
+            f"Folder mappings: {self._folder_to_usd}"
+        )
+
+    def get_target_candidates(self) -> list[tuple[str, str]]:
+        """스폰 가능한 타겟 오브젝트 정보 리스트
+        
+        Returns
+        -------
+        list[tuple[str, str]]
+            [(폴더이름, USD이름), ...] 형태의 리스트
+        """
+        result = []
+        # 폴더 이름 → USD 이름 매핑 기반으로 리스트 생성
+        for folder_name, usd_name in self._folder_to_usd.items():
+            result.append((folder_name, usd_name))
+        return result
+    
+    @property
+    def folder_to_usd(self) -> dict[str, str]:
+        """폴더 이름 → USD 파일 이름 매핑"""
+        return dict(self._folder_to_usd)
+
+    def spawn_single_object(self, obj_index: int, position: torch.Tensor, env_indices: list[int] = None) -> None:
+        """단일 오브젝트를 특정 위치에 스폰 (특정 환경만 지정 가능)
+        
+        Parameters
+        ----------
+        obj_index : int
+            오브젝트 인덱스
+        position : torch.Tensor
+            로컬 위치 (container 기준) - shape: (3,) 또는 (num_envs, 3)
+        env_indices : list[int], optional
+            스폰할 환경 인덱스 리스트. None이면 모든 환경에 적용
+        """
+        if obj_index >= len(self._item_views):
+            return
+        
+        view = self._item_views[obj_index]
+        container_world_pos, _ = self._container_view.get_world_poses()
+        
+        if position.dim() == 1:
+            # 모든 환경에 동일 위치
+            local_offsets = position.unsqueeze(0).expand(self._num_envs, -1)
+        else:
+            local_offsets = position
+        
+        world_positions = container_world_pos + local_offsets
+        
+        if env_indices is not None:
+            # 특정 환경만 업데이트
+            current_pos, current_orient = view.get_world_poses()
+            for env_idx in env_indices:
+                current_pos[env_idx] = world_positions[env_idx]
+            view.set_world_poses(current_pos)
+        else:
+            view.set_world_poses(world_positions)
+
+    def spawn_with_similarity(
+        self,
+        target_name: str,
+        world,
+        stabilization_steps: int = 60,
+        final_stabilization_steps: int = 120,
+        target_not_bottom_prob: float = 0.0,
+        target_top_prob: float = 0.5,
+    ) -> None:
+        """유사도 기반으로 타겟 오브젝트 주변에 순차적으로 오브젝트를 스폰
+
+        각 환경마다 독립적인 랜덤 scene을 생성합니다.
+
+        Parameters
+        ----------
+        target_name : str
+            타겟 오브젝트 이름 (예: "book_1", "fruit_2")
+        world : World
+            시뮬레이션 월드 (물리 스텝용)
+        stabilization_steps : int
+            각 오브젝트 투하 후 안정화 스텝 수
+        final_stabilization_steps : int
+            모든 오브젝트 투하 후 최종 안정화 스텝 수
+        target_not_bottom_prob : float
+            target이 맨 아래(첫 번째 투하)가 아닐 확률 [0, 1]
+        target_top_prob : float
+            맨 아래가 아닌 경우 중 맨 위(마지막 투하)일 확률 [0, 1]
+        """
+        # 1. 타겟 오브젝트 찾기
+        target_idx = self.get_object_index_by_name(target_name)
+        target_category = self._objects_class[self._spawned_names[target_idx]].lower()
+
+        container_world_pos, _ = self._container_view.get_world_poses()
+
+        # 2. 각 환경별로 타겟 투하 위치 사전 계산 (랜덤)
+        x_min, x_max = self._bounds["x"]
+        y_min, y_max = self._bounds["y"]
+        z_drop = self._bounds.get("z_drop", self._bounds["z_surface"] + 0.15)
+
+        target_positions = torch.zeros(self._num_envs, 3, device=self._device)
+        for env_idx in range(self._num_envs):
+            target_positions[env_idx] = torch.tensor([
+                random.uniform(x_min * 0.5, x_max * 0.5),
+                random.uniform(y_min * 0.5, y_max * 0.5),
+                z_drop
+            ], device=self._device)
+
+        # 3. 각 오브젝트의 유사도 점수 계산 (스폰 반경 결정용)
+        obj_scores: dict[int, float] = {}
+        for i, obj_name in enumerate(self._spawned_names):
+            if i == target_idx:
+                continue
+            obj_category = self._objects_class[obj_name].lower()
+            score = SIMILARITY_MAP.get(target_category, {}).get(obj_category, 0.2)
+            obj_scores[i] = score
+
+        all_obj_indices = list(obj_scores.keys())
+
+        # 4. 각 환경별 스폰 순서 결정 (target 삽입 위치 포함)
+        # 순서 항목: (obj_idx, score_or_None)  ← target은 score=None
+        env_spawn_orders: list[list[tuple[int, float | None]]] = []
+        for env_idx in range(self._num_envs):
+            shuffled = all_obj_indices.copy()
+            random.shuffle(shuffled)
+            other_order = [(idx, obj_scores[idx]) for idx in shuffled]
+
+            if random.random() < target_not_bottom_prob:
+                if random.random() < target_top_prob:
+                    # 맨 마지막(위)
+                    order = other_order + [(target_idx, None)]
+                else:
+                    # 중간 (1 ~ len 사이 랜덤 위치)
+                    insert_pos = random.randint(1, len(other_order))
+                    order = other_order[:insert_pos] + [(target_idx, None)] + other_order[insert_pos:]
+            else:
+                # 맨 처음(아래)
+                order = [(target_idx, None)] + other_order
+
+            env_spawn_orders.append(order)
+
+        # 5. 순차 투하
+        max_spawn_count = max(len(order) for order in env_spawn_orders)
+        target_spawned = [False] * self._num_envs  # env별 target 투하 완료 여부
+
+        for spawn_step in range(max_spawn_count):
+            for env_idx in range(self._num_envs):
+                if spawn_step >= len(env_spawn_orders[env_idx]):
+                    continue
+
+                obj_idx, score = env_spawn_orders[env_idx][spawn_step]
+
+                if obj_idx == target_idx:
+                    # 타겟 투하
+                    current_pos, current_orient = self._item_views[target_idx].get_world_poses()
+                    current_pos[env_idx] = container_world_pos[env_idx] + target_positions[env_idx]
+                    self._item_views[target_idx].set_world_poses(current_pos, current_orient)
+                    target_spawned[env_idx] = True
+                else:
+                    # 일반 오브젝트: target의 계획된 위치(미투하) 또는 실제 위치(투하 완료) 기준
+                    if target_spawned[env_idx]:
+                        cur_target_pos, _ = self._item_views[target_idx].get_world_poses()
+                        local_target = cur_target_pos[env_idx] - container_world_pos[env_idx]
+                    else:
+                        local_target = target_positions[env_idx]
+
+                    radius = SCORE_TO_RADIUS.get(score, 0.15)
+                    r = radius * math.sqrt(random.random())
+                    theta = random.random() * 2 * math.pi
+
+                    spawn_x = torch.clamp(
+                        local_target[0] + r * math.cos(theta),
+                        torch.tensor(x_min, device=self._device),
+                        torch.tensor(x_max, device=self._device)
+                    )
+                    spawn_y = torch.clamp(
+                        local_target[1] + r * math.sin(theta),
+                        torch.tensor(y_min, device=self._device),
+                        torch.tensor(y_max, device=self._device)
+                    )
+                    spawn_z = z_drop + random.uniform(-0.05, 0.1)
+
+                    current_pos, current_orient = self._item_views[obj_idx].get_world_poses()
+                    current_pos[env_idx] = container_world_pos[env_idx] + torch.tensor(
+                        [spawn_x, spawn_y, spawn_z], device=self._device
+                    )
+                    self._item_views[obj_idx].set_world_poses(current_pos, current_orient)
+
+            # 물리 안정화 (모든 환경 동시에)
+            for _ in range(stabilization_steps):
+                world.step(render=True)
+
+        # 6. 최종 안정화
+        for _ in range(final_stabilization_steps):
+            world.step(render=True)
+
     def initialize(self) -> None:
-        """Move all items back to the default position (outside the
+        """Move all items back to their individual waiting positions (outside the
         workspace) across all cloned environments."""
         container_world_pos, _ = self._container_view.get_world_poses()
-        default_offset = self._default_position.unsqueeze(0).expand(
-            self._num_envs, -1
-        )
-        world_positions = container_world_pos + default_offset
-        for view in self._item_views:
+        
+        for i, view in enumerate(self._item_views):
+            # 각 물체마다 다른 대기 위치 사용
+            wait_pos = self._wait_positions[i].unsqueeze(0).expand(self._num_envs, -1)
+            world_positions = container_world_pos + wait_pos
             view.set_world_poses(world_positions)
 
     def get_prim_paths(self) -> list[str]:
@@ -236,18 +493,38 @@ class ObjectSpawner:
 
         # Load assets (up to num_to_spawn)
         asset_items = list(self._objects_dir.items())[: self._num_to_spawn]
+        
+        # 대기 위치 설정: 8개씩 2줄로 배치 (워크스페이스 밖)
+        # 배치: x=0.8 (워크스페이스 밖), y는 물체마다 다르게 (좌우 나열), z는 고정
+        ITEMS_PER_ROW = 8
+        ROW_SPACING = 0.2  # 줄 간격 (x)
+        ITEM_SPACING = 0.15  # 물체 간격 (y, 좌우)
+        WAIT_X = 0.8  # 대기 x 위치 (워크스페이스 밖)
+        WAIT_Z = 0.1  # 대기 z 높이 (고정)
+        
+        self._wait_positions: list[torch.Tensor] = []  # 각 물체의 대기 위치 저장
 
         for i, (name, asset_path) in enumerate(asset_items):
             prim_path = f"{self._container_path}/object_{i}"
+            
+            # 대기 위치 계산: 8개씩 2줄로 배치 (Y축으로 좌우 나열)
+            row = i // ITEMS_PER_ROW  # 0, 1, 2, ... (줄 번호)
+            col = i % ITEMS_PER_ROW   # 0~7 (열 번호)
+            wait_pos = torch.tensor([
+                WAIT_X + row * ROW_SPACING,  # X: 줄마다 뒤로 배치
+                -0.5 + col * ITEM_SPACING,   # Y: 좌우로 나열 (-0.5 ~ 0.55)
+                WAIT_Z  # Z: 고정 높이
+            ], device=self._device)
+            self._wait_positions.append(wait_pos)
 
             add_reference_to_stage(usd_path=asset_path, prim_path=prim_path)
 
             prim = SingleRigidPrim(
                 prim_path=prim_path,
                 name=f"{self._container_prefix}_{name}",
-                position=self._default_position,
+                position=wait_pos,
             )
-            prim.set_default_state(position=self._default_position)
+            prim.set_default_state(position=wait_pos)
             self._world.scene.add(prim)
 
             self._spawned_prims.append(prim)
