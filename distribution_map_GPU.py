@@ -13,7 +13,7 @@ import torch
 # ==============================================================================
 
 # --- Occlusion map 생성 ---
-OCCLUSION_THRESHOLD  = 0.6   # 이 비율 이상 가려져야 occluded로 간주
+OCCLUSION_THRESHOLD  = 0.7   # 이 비율 이상 가려져야 occluded로 간주
 
 # --- Distribution map 결합 ---
 BETA                 = 0.7   # occlusion map 가중치 (similarity = 1-BETA)
@@ -59,7 +59,8 @@ target_proc_dir  = os.path.join(target_base, "processed_depth")
 scene_seg_dir    = os.path.join(scene_base, "seg")
 scene_depth_dir  = os.path.join(scene_base, "depth")
 scene_proc_dir   = os.path.join(scene_base, "processed_depth")
-scene_dis_dir    = os.path.join(scene_base, "depth_dis_map")
+scene_dis_dir         = os.path.join(scene_base, "depth_dis_map")
+empty_scene_depth_dir = os.path.join(target_base, "empty_scene", "depth")
 
 # ==============================================================================
 # target 정보 로드
@@ -282,6 +283,17 @@ def create_depth_distribution_map_gpu():
 
         print(f"[{cam}] scene={len(scene_files)}장, target={len(target_files)}장 처리 시작")
 
+        # ── empty scene depth 로드 (카메라당 1회) ─────────────────────────────
+        _empty_path = os.path.join(empty_scene_depth_dir, f"{cam}.npy")
+        if os.path.exists(_empty_path):
+            _ed = np.nan_to_num(np.load(_empty_path).squeeze(), nan=0.0).astype(np.float32)
+            empty_depth_gpu = torch.from_numpy(_ed).to(device)  # [H, W]
+            print(f"  [{cam}] empty_scene depth 로드 완료")
+        else:
+            empty_depth_gpu = None
+            print(f"  [{cam}] [WARN] empty_scene depth 없음 → empty_scene.py 먼저 실행하세요.")
+            print(f"           경로: {_empty_path}")
+
         # ── scene 배치 단위로 처리 ─────────────────────────────────────────────
         for sc_start in range(0, len(scene_files), SCENE_GPU_BATCH):
             sc_batch = scene_files[sc_start : sc_start + SCENE_GPU_BATCH]
@@ -291,7 +303,9 @@ def create_depth_distribution_map_gpu():
             scenes_list: list[np.ndarray] = []
             H = W = None
             for sf in sc_batch:
-                s = np.load(os.path.join(scene_proc_dir, sf)).squeeze().astype(np.float32)
+                # scene/depth/ (전체 씬 depth, masking 없음) 로드
+                s = np.load(os.path.join(scene_depth_dir, sf)).squeeze().astype(np.float32)
+                s = np.nan_to_num(s, nan=0.0)
                 if H is None:
                     H, W = s.shape
                 scenes_list.append(s)
@@ -333,19 +347,28 @@ def create_depth_distribution_map_gpu():
                         continue
 
                     # object 픽셀만 추출: [SC, Npix]
-                    scene_obj  = scenes_gpu[:, object_mask]   # [SC, Npix]
+                    scene_obj  = scenes_gpu[:, object_mask]   # [SC, Npix] - 전체 씬 depth
                     target_obj = target_k[object_mask]         # [Npix]
 
-                    # ── 완전 은닉: scene==0 at target object pixels ───────────
-                    hidden = (scene_obj == 0).sum(dim=1).float()              # [SC]
+                    # ── 유효 위치 필터: empty 씬에서 shelf에 가려지지 않는 픽셀 ──
+                    # empty_depth == 0 → 열린 공간 (유효)
+                    # empty_depth >= target_depth → shelf이 scan 위치보다 멀리 있음 (유효)
+                    # empty_depth < target_depth → shelf이 scan 위치 앞에 있음 (항상 가려짐 → 제외)
+                    if empty_depth_gpu is not None:
+                        empty_obj  = empty_depth_gpu[object_mask]                # [Npix]
+                        valid_pos  = (empty_obj == 0) | (empty_obj >= target_obj)  # [Npix]
+                    else:
+                        valid_pos  = torch.ones(target_obj.shape, dtype=torch.bool, device=device)
 
-                    # ── 부분 은닉: scene < target, scene != 0 ─────────────────
-                    valid_mask = (scene_obj != 0)                              # [SC, Npix]
-                    depth_occ  = (
-                        (scene_obj < target_obj.unsqueeze(0)) & valid_mask
-                    ).sum(dim=1).float()                                       # [SC]
+                    # ── 은닉: 씬에서 scan 위치보다 가까운 물체가 있음 ─────────
+                    # scene_full < target AND scene_full != 0 AND valid_pos
+                    occ = (
+                        (scene_obj < target_obj.unsqueeze(0)) &
+                        (scene_obj != 0) &
+                        valid_pos.unsqueeze(0)
+                    )  # [SC, Npix]
 
-                    ratio = (hidden + depth_occ) / total_pixels               # [SC]
+                    ratio = occ.sum(dim=1).float() / total_pixels              # [SC]
                     above = (ratio >= OCCLUSION_THRESHOLD)                    # [SC] bool
 
                     if not above.any():
