@@ -65,3 +65,8 @@
 - GPU 메모리 사용량은 scene 수, 해상도, batch size에 민감합니다. `distribution_map_GPU.py`의 batch parameter를 환경에 맞게 조정하세요.
 - Asset 경로는 코드 내부 상수에 의존하는 부분이 있으므로, 새 asset을 추가할 때는 기존 디렉토리 convention을 유지하는 것이 좋습니다.
 - 생성 데이터는 용량이 커질 수 있으므로 git에 직접 추가하기보다 별도 storage 또는 ignored output directory로 관리하는 것을 권장합니다.
+
+## 라이선스
+
+이 저장소의 코드와 문서는 비상업적 사용만 허용하는 `Non-Commercial Source License`로 배포됩니다. 연구, 교육, 평가, 개인 학습 목적으로 사용할 수 있으며, 상업적 이용은 프로젝트 관리자에게 별도 허가를 받아야 합니다.
+
